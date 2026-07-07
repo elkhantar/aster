@@ -11,6 +11,7 @@ import (
 
 	"github.com/mgilbir/andsifr"
 	"github.com/mgilbir/andsifr/api"
+	"github.com/mgilbir/andsifr/experimental"
 	"github.com/mgilbir/andsifr/imports/wasi_snapshot_preview1"
 )
 
@@ -97,6 +98,11 @@ type Runtime struct {
 	rtPtr   uint32 // JSRuntime*
 	scratch uint32 // 8 bytes of guest memory for out-params
 
+	// capMem is set only for runtimes created via NewWarm. It records the
+	// andsifr module identity observed during instantiation, which Snapshot
+	// needs so a later Restore can bind its image to the exact same module.
+	capMem *captureMemory
+
 	timeout time.Duration
 	closed  bool
 }
@@ -105,13 +111,10 @@ type Runtime struct {
 // __aster_* bridge globals for the configured callbacks.
 func New(cfg Config) (*Runtime, error) {
 	ctx := context.Background()
-
-	rcfg := wazero.NewRuntimeConfig().
-		WithCompilationCache(compilationCache)
-	wrt := wazero.NewRuntimeWithConfig(ctx, rcfg)
+	wrt := newWazeroRuntime(ctx)
 
 	r := &Runtime{wrt: wrt, timeout: cfg.Timeout}
-	if err := r.instantiate(ctx, cfg); err != nil {
+	if err := r.instantiate(ctx, cfg, nil, true); err != nil {
 		_ = wrt.Close(ctx)
 		return nil, err
 	}
@@ -122,7 +125,22 @@ func New(cfg Config) (*Runtime, error) {
 	return r, nil
 }
 
-func (r *Runtime) instantiate(ctx context.Context, cfg Config) error {
+// newWazeroRuntime builds a wazero runtime sharing the process-wide compilation
+// cache. Every Runtime still compiles + instantiates within its own wazero
+// runtime, so no compiled-module state ever crosses wazero runtimes.
+func newWazeroRuntime(ctx context.Context) wazero.Runtime {
+	rcfg := wazero.NewRuntimeConfig().
+		WithCompilationCache(compilationCache)
+	return wazero.NewRuntimeWithConfig(ctx, rcfg)
+}
+
+// instantiate compiles and instantiates the QuickJS WASM module and wires its
+// exports. When alloc is non-nil it backs the instance's linear memory (used
+// for snapshot capture and restore). runInit controls whether the WASI
+// reactor's _initialize runs: true for a fresh engine, false when restoring a
+// snapshot image whose guest initialization already ran (re-running it would
+// corrupt the warmed heap).
+func (r *Runtime) instantiate(ctx context.Context, cfg Config, alloc experimental.MemoryAllocator, runInit bool) error {
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r.wrt); err != nil {
 		return fmt.Errorf("quickjs: instantiating WASI: %w", err)
 	}
@@ -149,11 +167,22 @@ func (r *Runtime) instantiate(ctx context.Context, cfg Config) error {
 		WithSysWalltime().
 		WithSysNanotime().
 		WithSysNanosleep()
-	if _, ok := compiled.ExportedFunctions()["_initialize"]; ok {
-		mcfg = mcfg.WithStartFunctions("_initialize")
+	if runInit {
+		if _, ok := compiled.ExportedFunctions()["_initialize"]; ok {
+			mcfg = mcfg.WithStartFunctions("_initialize")
+		}
+	} else {
+		// Restoring a snapshot image: the guest is already initialized, so run
+		// no start functions (clearing the default "_start" too).
+		mcfg = mcfg.WithStartFunctions()
 	}
 
-	mod, err := r.wrt.InstantiateModule(ctx, compiled, mcfg)
+	instCtx := ctx
+	if alloc != nil {
+		instCtx = experimental.WithMemoryAllocator(ctx, alloc)
+	}
+
+	mod, err := r.wrt.InstantiateModule(instCtx, compiled, mcfg)
 	if err != nil {
 		return fmt.Errorf("quickjs: instantiating module: %w", err)
 	}
@@ -248,22 +277,39 @@ func (r *Runtime) initEngine(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	// Arm the JS stack-overflow guard (re-enabled on WASI by
-	// quickjs-wasm/stack-guard.patch). Calling JS_UpdateStackTop here — a
-	// fresh, shallow wasm entry — captures a reliable stack top; init above
-	// ran unguarded, matching upstream. The 1MB budget must stay well under
-	// both the 8MB linker stack in quickjs.wasm and wazero's native
-	// call-stack ceiling (each guest frame costs far more native stack than
-	// guest stack), so runaway recursion (e.g. animation specs bouncing off
-	// the immediate setTimeout polyfill) raises a catchable RangeError
-	// instead of overflowing either stack.
+	if err := r.armEngine(ctx, cfg); err != nil {
+		return err
+	}
+
+	boot := bootstrapScript(cfg.Bridge)
+	if boot != "" {
+		if err := r.evalGlobal(ctx, "__aster_bootstrap__.js", boot); err != nil {
+			return fmt.Errorf("quickjs: bridge bootstrap: %w", err)
+		}
+	}
+	return nil
+}
+
+// armEngine arms the JS stack-overflow guard and applies the configured memory
+// limit. It is called after a fresh engine init and again after restoring a
+// snapshot, so a restored instance re-captures its own stack top and honors
+// cfg's limits (the stack guard was re-enabled on WASI by
+// quickjs-wasm/stack-guard.patch).
+//
+// Calling JS_UpdateStackTop from here — a fresh, shallow wasm entry — captures
+// a reliable stack top; engine init ran unguarded, matching upstream. The 1MB
+// budget must stay well under both the 8MB linker stack in quickjs.wasm and
+// wazero's native call-stack ceiling (each guest frame costs far more native
+// stack than guest stack), so runaway recursion (e.g. animation specs bouncing
+// off the immediate setTimeout polyfill) raises a catchable RangeError instead
+// of overflowing either stack.
+func (r *Runtime) armEngine(ctx context.Context, cfg Config) error {
 	if _, err := r.fnUpdateStackTop.Call(ctx, uint64(r.rtPtr)); err != nil {
 		return fmt.Errorf("quickjs: JS_UpdateStackTop: %w", err)
 	}
 	if _, err := r.fnSetMaxStackSize.Call(ctx, uint64(r.rtPtr), uint64(uint32(jsStackSize))); err != nil {
 		return fmt.Errorf("quickjs: JS_SetMaxStackSize: %w", err)
 	}
-
 	if cfg.MemoryLimit > 0 {
 		limit := cfg.MemoryLimit
 		if limit > math.MaxUint32 {
@@ -271,13 +317,6 @@ func (r *Runtime) initEngine(ctx context.Context, cfg Config) error {
 		}
 		if _, err := r.fnSetMemoryLimit.Call(ctx, uint64(r.rtPtr), limit); err != nil {
 			return fmt.Errorf("quickjs: JS_SetMemoryLimit: %w", err)
-		}
-	}
-
-	boot := bootstrapScript(cfg.Bridge)
-	if boot != "" {
-		if err := r.evalGlobal(ctx, "__aster_bootstrap__.js", boot); err != nil {
-			return fmt.Errorf("quickjs: bridge bootstrap: %w", err)
 		}
 	}
 	return nil

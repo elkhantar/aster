@@ -45,6 +45,11 @@ type Converter struct {
 var errConverterClosed = errors.New("aster: converter is closed")
 
 // New creates a new Converter with the given options.
+//
+// New warms the QuickJS engine cold: it evaluates the vendored Vega/Vega-Lite
+// bundle (~145ms) on every call. To build many identically-configured
+// Converters (e.g. a converter pool) at a fraction of that cost, use a Factory,
+// which warms once and restores a memory snapshot for every later Converter.
 func New(opts ...Option) (*Converter, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
@@ -62,18 +67,39 @@ func New(opts ...Option) (*Converter, error) {
 	// PNG rasterization can't disagree about fonts or generic-family mappings.
 	plan := newFontPlan(cfg)
 
-	var measurer *textmeasure.Measurer
-	var tm runtime.TextMeasurer
-	if cfg.textMeasure {
-		var err error
-		measurer, err = textmeasure.New(plan.measurerOptions()...)
-		if err != nil {
-			return nil, fmt.Errorf("aster: initializing text measurer: %w", err)
-		}
-		tm = measurer
+	measurer, tm, err := buildMeasurer(cfg, plan)
+	if err != nil {
+		return nil, err
 	}
 
-	rtCfg := runtime.Config{
+	rt, err := runtime.New(runtimeConfig(cfg, tm))
+	if err != nil {
+		// runtime.New already namespaces its errors ("aster/runtime: ...");
+		// don't double-prefix.
+		return nil, err
+	}
+
+	return assembleConverter(rt, plan, measurer, cfg.loader), nil
+}
+
+// buildMeasurer builds the text measurer (and its runtime adapter) from the
+// font plan, or returns nils when text measurement is disabled. A fresh
+// measurer is built per Converter so Converters never share mutable
+// measurement state.
+func buildMeasurer(cfg *config, plan fontPlan) (*textmeasure.Measurer, runtime.TextMeasurer, error) {
+	if !cfg.textMeasure {
+		return nil, nil, nil
+	}
+	measurer, err := textmeasure.New(plan.measurerOptions()...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("aster: initializing text measurer: %w", err)
+	}
+	return measurer, measurer, nil
+}
+
+// runtimeConfig maps the Converter config to the runtime config.
+func runtimeConfig(cfg *config, tm runtime.TextMeasurer) runtime.Config {
+	return runtime.Config{
 		Loader:       cfg.loader,
 		TextMeasurer: tm,
 		Theme:        cfg.theme,
@@ -82,20 +108,17 @@ func New(opts ...Option) (*Converter, error) {
 		Version:      cfg.vegaLiteVersion,
 		Timezone:     cfg.timezone,
 	}
+}
 
-	rt, err := runtime.New(rtCfg)
-	if err != nil {
-		// runtime.New already namespaces its errors ("aster/runtime: ...");
-		// don't double-prefix.
-		return nil, err
-	}
-
+// assembleConverter wires a ready runtime, font plan, and measurer into a
+// Converter.
+func assembleConverter(rt *runtime.Runtime, plan fontPlan, measurer *textmeasure.Measurer, loader Loader) *Converter {
 	return &Converter{
 		rt:       rt,
 		measurer: measurer,
 		fonts:    plan,
-		loader:   cfg.loader,
-	}, nil
+		loader:   loader,
+	}
 }
 
 // VersionInfo describes an available Vega-Lite version set.

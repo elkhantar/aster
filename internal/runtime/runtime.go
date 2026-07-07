@@ -73,25 +73,47 @@ type manifestModule struct {
 // New creates a new Runtime, loading all vendored JS modules and registering
 // Go bridge functions.
 func New(cfg Config) (*Runtime, error) {
-	rt, err := quickjs.New(quickjs.Config{
+	return newRuntime(cfg, quickjs.New)
+}
+
+// qjsConfig maps the runtime configuration to the QuickJS engine config.
+func qjsConfig(cfg Config) quickjs.Config {
+	return quickjs.Config{
 		MemoryLimit: cfg.MemoryLimit,
 		Timeout:     cfg.Timeout,
 		Bridge:      bridgeConfig(cfg),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("aster/runtime: creating QuickJS runtime: %w", err)
 	}
+}
 
+// resolveVersion fills in the default version and validates it against the
+// available version sets, returning the resolved cfg.
+func resolveVersion(cfg Config) (Config, error) {
 	idx, err := readVersionIndex()
 	if err != nil {
-		_ = rt.Close()
-		return nil, err
+		return cfg, err
 	}
 	if cfg.Version == "" {
 		cfg.Version = idx.Default
 	} else if _, ok := idx.Versions[cfg.Version]; !ok {
+		return cfg, fmt.Errorf("aster/runtime: unknown Vega-Lite version set %q; available: %s", cfg.Version, idx.describe())
+	}
+	return cfg, nil
+}
+
+// newRuntime builds a Runtime using mk to construct the underlying QuickJS
+// engine (quickjs.New for a cold runtime, quickjs.NewWarm for a
+// snapshot-capable one), then installs polyfills and loads the vendored
+// Vega/Vega-Lite modules.
+func newRuntime(cfg Config, mk func(quickjs.Config) (*quickjs.Runtime, error)) (*Runtime, error) {
+	rt, err := mk(qjsConfig(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("aster/runtime: creating QuickJS runtime: %w", err)
+	}
+
+	cfg, err = resolveVersion(cfg)
+	if err != nil {
 		_ = rt.Close()
-		return nil, fmt.Errorf("aster/runtime: unknown Vega-Lite version set %q; available: %s", cfg.Version, idx.describe())
+		return nil, err
 	}
 
 	r := &Runtime{rt: rt, config: cfg}
